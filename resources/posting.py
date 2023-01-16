@@ -30,11 +30,15 @@ class PostingResource(Resource) :
             return {'error' : '이미지 파일이 아닙니다.'}
 
         # 사진명을 유니크하게 변경해서 S3에 업로드
-        current_time = datetime.now()
-        new_file_name = current_time.isoformat().replace(':', '_') + '.' + file.content_type.split('/')[-1]
-        file.filename = new_file_name
-        client =  boto3.client('s3', aws_access_key_id= Config.ACCESS_KEY, aws_secret_access_key= Config.SECRET_ACCESS)
+        # aws 콘솔로 가서 IAM 유저만들고 S3 버킷을 만들어서 config.py에 입력
 
+        # 파일명 유니크하게 변경
+        current_time = datetime.now()
+        new_file_name = str(userId) + current_time.isoformat().replace(':', '_') + '.' + file.content_type.split('/')[-1]
+        file.filename = new_file_name
+
+        # 파일 S3에 업로드 (boto3사용)
+        client =  boto3.client('s3', aws_access_key_id= Config.ACCESS_KEY, aws_secret_access_key= Config.SECRET_ACCESS)
         try :
             client.upload_fileobj(file, Config.S3_BUCKET, new_file_name, ExtraArgs= {'ACL' : 'public-read', 'ContentType' : file.content_type})
         
@@ -44,22 +48,72 @@ class PostingResource(Resource) :
         # 저장된 사진의 imgUrl
         imgUrl = Config.S3_LOCATION + new_file_name
 
+        # S3저장된 사진을 Amazon Rekognition 사용하여 Object Detection
+        client = boto3.client('rekognition', 'ap-northeast-2', aws_access_key_id= Config.ACCESS_KEY, aws_secret_access_key= Config.SECRET_ACCESS)
+        response = client.detect_labels(Image= {'S3Object' : {'Bucket' : Config.S3_BUCKET, 'Name' : new_file_name}}, MaxLabels= 5)
+
+        # 태그 저장 
+        tag_list = []
+        for row in response['Labels'] :
+            tag_list.append(row['Name'])
+
         # DB에 저장
         try :
             connection = get_connection()
 
+            # 포스팅 테이블 저장
             query = '''insert into posting
                     (userId, imgUrl, content)
                     values (%s, %s, %s);'''
 
-            record = (userId, imgUrl, imgUrl)
+            record = (userId, imgUrl, content)
 
             cursor = connection.cursor()
 
             cursor.execute(query, record)
 
-            connection.commit()
+            # 저장한 포스팅 테이블 id 가져오기
+            postingId = cursor.lastrowid
 
+            # 태그네임 테이블 저장
+            # tag_list가 tag_name 테이블에 들어있는지 확인해서 있으면
+            # 그 tag_name의 아이디를 가져오고 없으면 tag_name에 넣어준다
+            for name in tag_list :
+                query = '''select *
+                        from tag_name
+                        where name = %s ;'''
+                record = (name, )
+                cursor = connection.cursor(dictionary= True)
+                cursor.execute(query, record)
+                result_list = cursor.fetchall()
+
+                if len(result_list) == 0 :
+                    query = '''insert into tag_name
+                    (name)
+                    values (%s);'''
+                    record = (name, )
+                    cursor = connection.cursor()
+                    cursor.execute(query, record)
+                    tagId = cursor.lastrowid
+
+                else :
+                    tagId = result_list[0]['id']
+
+                # tag 테이블에 postingId와 tagId를 저장한다
+                query = '''insert into tag
+                        (postingId, tagId)
+                        values
+                        (%s, %s)'''
+
+                record = (postingId, tagId)
+
+                cursor = connection.cursor()
+
+                cursor.execute(query, record)
+
+            # 커밋은 쿼리문이 끝난 마지막에 해준다
+            connection.commit()
+        
             cursor.close()
             connection.close()
 
@@ -294,3 +348,4 @@ class followeePostingResource(Resource) :
             return {"error" : str(e)}, 500
 
         return {"result" : "success", "items" : result_list, "count" : len(result_list)}, 200
+
